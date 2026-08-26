@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$ROOT_DIR/.env"
+ENV_EXAMPLE="$ROOT_DIR/.env.example"
+CERT_DIR="$ROOT_DIR/docker/nginx/certs"
+
+cd "$ROOT_DIR"
+
+host_ip_is_free() {
+    local ip="$1"
+
+    if (echo >"/dev/tcp/$ip/443") >/dev/null 2>&1; then
+        return 1
+    fi
+
+    return 0
+}
+
+pick_host_ip() {
+    local third
+    local fourth
+    local ip
+    local attempt
+
+    for ((attempt = 0; attempt < 1000; attempt++)); do
+        third=$((1 + RANDOM % 254))
+        fourth=$((1 + RANDOM % 254))
+        ip="127.0.${third}.${fourth}"
+
+        if host_ip_is_free "$ip"; then
+            printf '%s\n' "$ip"
+            return
+        fi
+    done
+
+    printf 'Could not find a free loopback IP on port 443.\n' >&2
+    return 1
+}
+
+ensure_certs() {
+    local host_file="$CERT_DIR/.host-ip"
+
+    if [[ -f "$CERT_DIR/dev.pem" \
+        && -f "$CERT_DIR/dev-key.pem" \
+        && -f "$host_file" \
+        && "$(cat "$host_file")" == "$APP_HOST_IP" ]]; then
+        return
+    fi
+
+    if ! command -v mkcert >/dev/null 2>&1; then
+        printf 'mkcert is required to generate HTTPS certificates.\n' >&2
+        exit 1
+    fi
+
+    mkdir -p "$CERT_DIR"
+
+    rm -f \
+        "$CERT_DIR/dev.pem" \
+        "$CERT_DIR/dev-key.pem" \
+        "$host_file"
+
+    mkcert \
+        -cert-file "$CERT_DIR/dev.pem" \
+        -key-file "$CERT_DIR/dev-key.pem" \
+        localhost \
+        127.0.0.1 \
+        "$APP_HOST_IP" \
+        ::1
+
+    printf '%s\n' "$APP_HOST_IP" > "$host_file"
+}
+
+generate_push_key() {
+    if ! command -v od >/dev/null 2>&1 || ! command -v tr >/dev/null 2>&1; then
+        printf 'od and tr are required to generate PUSH_SECURITY_KEY.\n' >&2
+        exit 1
+    fi
+
+    od -An -N64 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+ensure_env() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        cp "$ENV_EXAMPLE" "$ENV_FILE"
+    fi
+
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+
+    if [[ -z "${HOST_UID:-}" ]]; then
+        HOST_UID="$(id -u)"
+    fi
+
+    if [[ -z "${HOST_GID:-}" ]]; then
+        HOST_GID="$(id -g)"
+    fi
+
+    if [[ -z "${PUSH_SECURITY_KEY:-}" ]]; then
+        PUSH_SECURITY_KEY="$(generate_push_key)"
+    fi
+
+    if [[ -z "${APP_HOST_IP:-}" ]]; then
+        APP_HOST_IP="$(pick_host_ip)"
+    fi
+
+    cat > "$ENV_FILE" <<EOF
+HOST_UID=$HOST_UID
+HOST_GID=$HOST_GID
+PUSH_SECURITY_KEY=$PUSH_SECURITY_KEY
+APP_HOST_IP=$APP_HOST_IP
+MYSQL_DATABASE=${MYSQL_DATABASE:-bitrix}
+MYSQL_USER=${MYSQL_USER:-bitrix}
+MYSQL_PASSWORD=${MYSQL_PASSWORD:-bitrix}
+MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-bitrix-root}
+EOF
+}
+
+ensure_www() {
+    mkdir -p "$ROOT_DIR/www"
+}
+
+create_bitrix_gitignore() {
+    mkdir -p "$ROOT_DIR/www"
+
+    if [[ -e "$ROOT_DIR/www/.gitignore" ]]; then
+        printf 'www/.gitignore already exists. Nothing changed.\n'
+        return
+    fi
+
+    cat > "$ROOT_DIR/www/.gitignore" <<'EOF'
+# Bitrix core
+/bitrix/
+
+# User-uploaded/runtime files
+/upload/
+
+# Local runtime/generated files
+/local/vendor/
+
+# Bootstrap scripts
+/bitrixsetup.php
+/restore.php
+
+# Editors / Vim
+*.swp
+*.swo
+*.swn
+.*.sw?
+*~
+Session.vim
+Sessionx.vim
+.vim/
+.idea/
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.log.*
+logs/
+log/
+
+# Temporary / debug files
+*.tmp
+*.temp
+*.debug
+*.trace
+*.cache
+*.pid
+nohup.out
+
+# Backups / merge leftovers
+*.bak
+*.backup
+*.old
+*.orig
+*.rej
+
+# Development artifacts
+*.patch
+*.diff
+*.dump
+*.sql
+*.sql.gz
+
+# Crash dumps
+core
+core.*
+
+# Dependencies
+**/node_modules/
+EOF
+
+    printf 'Created www/.gitignore.\n'
+}
+
+show_urls() {
+    ensure_env
+    source "$ENV_FILE"
+
+    printf 'Site:       https://%s\n' "$APP_HOST_IP"
+    printf 'phpMyAdmin: https://%s/phpmyadmin/\n' "$APP_HOST_IP"
+    printf 'Mailpit:    https://%s/mailpit/\n' "$APP_HOST_IP"
+}
+
+get_xdebug_network() {
+    local php_container
+    local network
+
+    php_container="$(docker compose ps -q php)"
+
+    if [[ -z "$php_container" ]]; then
+        printf 'PHP container is not running. Run ./bin/dev up first.\n' >&2
+        return 1
+    fi
+
+    network="$(
+        docker inspect \
+            -f '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}}{{println}}{{end}}' \
+            "$php_container" \
+            | sed -n '1p'
+    )"
+
+    if [[ -z "$network" ]]; then
+        printf 'Cannot determine the PHP container network.\n' >&2
+        return 1
+    fi
+
+    printf '%s\n' "$network"
+}
+
+setup_xdebug() {
+    local network
+    local subnet
+
+    network="$(get_xdebug_network)"
+    subnet="$(
+        docker network inspect \
+            -f '{{(index .IPAM.Config 0).Subnet}}' \
+            "$network"
+    )"
+
+    if [[ -z "$subnet" ]]; then
+        printf 'Cannot determine Docker subnet for %s.\n' "$network" >&2
+        return 1
+    fi
+
+    printf 'Docker network: %s\n' "$network"
+    printf 'Docker subnet:  %s\n' "$subnet"
+
+    if ! command -v ufw >/dev/null 2>&1; then
+        printf 'UFW is not installed. No UFW rule was added.\n'
+        return
+    fi
+
+    if ! sudo ufw status | grep -q '^Status: active'; then
+        printf 'UFW is not active. No UFW rule is required.\n'
+        return
+    fi
+
+    sudo ufw allow \
+        from "$subnet" \
+        to any \
+        port 9003 \
+        proto tcp \
+        comment 'Docker Xdebug'
+
+    printf 'Xdebug firewall configuration: OK\n'
+}
+
+check_xdebug() {
+    if [[ -z "$(docker compose ps -q php)" ]]; then
+        printf 'PHP container is not running. Run ./bin/dev up first.\n' >&2
+        return 1
+    fi
+
+    docker compose exec -T php php -r '
+$version = phpversion("xdebug");
+
+if ($version === false) {
+    fwrite(STDERR, "Xdebug extension is not loaded.\n");
+    exit(1);
+}
+
+$host = ini_get("xdebug.client_host");
+$port = (int) ini_get("xdebug.client_port");
+
+printf("Xdebug version:            %s\n", $version);
+printf("Xdebug mode:               %s\n", ini_get("xdebug.mode"));
+printf("Xdebug start_with_request: %s\n", ini_get("xdebug.start_with_request"));
+printf("DAP host:                  %s (%s)\n", $host, gethostbyname($host));
+printf("DAP port:                  %d\n", $port);
+
+$socket = @fsockopen($host, $port, $errno, $errstr, 2);
+$connected = is_resource($socket);
+
+if ($connected) {
+    fclose($socket);
+}
+
+printf(
+    "DAP connection:            %s\n",
+    $connected ? "OK" : "FAILED"
+);
+
+if (!$connected) {
+    fwrite(
+        STDERR,
+        "Start an IDE/DAP listener on TCP 9003 and check the host firewall.\n"
+    );
+    exit(1);
+}
+'
+}
+
+command="${1:-help}"
+shift || true
+
+configure_bitrix() {
+    if [[ ! -f "$ROOT_DIR/www/bitrix/php_interface/dbconn.php" ]]; then
+        printf 'Bitrix is not installed. Install or restore it first.\n' >&2
+        return 1
+    fi
+
+    docker compose exec \
+        --user "$HOST_UID:$HOST_GID" \
+        -e APP_HOST_IP="$APP_HOST_IP" \
+        -e PUSH_SECURITY_KEY="$PUSH_SECURITY_KEY" \
+        php \
+        php /opt/bitrix-template/configure.php
+}
+
+prepare_bitrix() {
+    local mode="${1:-}"
+    local script
+    local url
+    local tmp
+
+    case "$mode" in
+        install)
+            script="bitrixsetup.php"
+            url="https://www.1c-bitrix.ru/download/scripts/bitrixsetup.php"
+            ;;
+        restore)
+            script="restore.php"
+            url="https://www.1c-bitrix.ru/download/scripts/restore.php"
+            ;;
+        configure)
+            configure_bitrix
+            return
+            ;;
+        cleanup)
+            rm -f "$ROOT_DIR/www/bitrixsetup.php"
+            rm -f "$ROOT_DIR/www/restore.php"
+
+            if [[ -f "$ROOT_DIR/www/index.php" ]] \
+                && grep -qF 'bitrix-docker-template bootstrap redirect' "$ROOT_DIR/www/index.php"; then
+                rm "$ROOT_DIR/www/index.php"
+            fi
+
+            printf 'Bitrix bootstrap files removed.\n'
+            return
+            ;;
+        *)
+            printf 'Usage: ./bin/dev bitrix {install|restore|configure|cleanup}\n' >&2
+            return 1
+            ;;
+    esac
+
+    if [[ -d "$ROOT_DIR/www/bitrix" ]]; then
+        printf 'Bitrix already exists in www/bitrix. Refusing to overwrite it.\n' >&2
+        return 1
+    fi
+
+    if [[ -e "$ROOT_DIR/www/index.php" ]]; then
+        printf 'www/index.php already exists. Remove it before preparing Bitrix.\n' >&2
+        return 1
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        printf 'curl is required.\n' >&2
+        return 1
+    fi
+
+    rm -f "$ROOT_DIR/www/bitrixsetup.php" "$ROOT_DIR/www/restore.php"
+
+    tmp="$(mktemp "$ROOT_DIR/www/.${script}.XXXXXX")"
+
+    if ! curl -fL "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    mv "$tmp" "$ROOT_DIR/www/$script"
+
+    cat > "$ROOT_DIR/www/index.php" <<EOF
+<?php
+// bitrix-docker-template bootstrap redirect
+
+header('Location: /$script', true, 302);
+exit;
+EOF
+
+    printf 'Prepared: %s\n' "$mode"
+    printf 'Open:     https://%s/\n' "$APP_HOST_IP"
+}
+
+case "$command" in
+    up)
+        ensure_env
+        ensure_www
+        ensure_certs
+
+        docker compose up -d --build "$@"
+
+        docker compose exec -T nginx nginx -t
+        docker compose exec -T nginx nginx -s reload
+
+        show_urls
+        ;;
+    down)
+        docker compose down "$@"
+        ;;
+    restart)
+        ensure_env
+        docker compose restart "$@"
+        show_urls
+        ;;
+    status|ps)
+        docker compose ps "$@"
+        ;;
+    urls)
+        show_urls
+        ;;
+    shell)
+        ensure_env
+        docker compose exec --user "$HOST_UID:$HOST_GID" php bash "$@"
+        ;;
+    root)
+        docker compose exec --user root php bash "$@"
+        ;;
+    composer)
+        ensure_env
+        docker compose exec --user "$HOST_UID:$HOST_GID" php composer "$@"
+        ;;
+    npm)
+        ensure_www
+        docker compose run --rm node npm "$@"
+        ;;
+    logs)
+        docker compose logs -f "$@"
+        ;;
+    mysql)
+        ensure_env
+        source "$ENV_FILE"
+        docker compose exec mysql mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"
+        ;;
+    redis)
+        docker compose exec redis redis-cli "$@"
+        ;;
+		xdebug)
+        ensure_env
+
+        case "${1:-}" in
+            setup)
+                setup_xdebug
+                ;;
+            check)
+                check_xdebug
+                ;;
+            *)
+                printf 'Usage: ./bin/dev xdebug {setup|check}\n' >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    bitrix)
+        ensure_env
+        ensure_www
+        prepare_bitrix "${1:-}"
+        ;;
+    gitignore)
+        if (( $# != 0 )); then
+            printf 'Usage: ./bin/dev gitignore\n' >&2
+            exit 1
+        fi
+        create_bitrix_gitignore
+        ;;
+    reset)
+        printf 'This will permanently delete this project database volume.\n'
+        read -r -p 'Type RESET to continue: ' answer
+
+        if [[ "$answer" != "RESET" ]]; then
+            printf 'Cancelled.\n'
+            exit 1
+        fi
+
+        docker compose down --volumes
+        ;;
+    help|*)
+        cat <<'EOF'
+Usage: ./bin/dev COMMAND
+
+Commands:
+  up                      Start the environment
+  down                    Stop and remove containers
+  restart                 Restart containers
+  status                  Show service status
+  ps                      Show service status
+  urls                    Show local URLs
+  shell                   Open a shell in PHP
+  root                    Open a root shell in PHP
+  composer ...            Run Composer in PHP
+  npm ...                 Run npm in the Node toolbox
+  logs [service]          Follow logs
+  mysql                   Open MySQL CLI
+  redis ...               Run redis-cli
+  gitignore               Create www/.gitignore if absent
+  reset                   Delete containers and database volume
+  bitrix install          Prepare fresh Bitrix installation
+  bitrix restore          Prepare Bitrix backup restoration
+  bitrix configure        Configure installed Bitrix for Docker environment
+  bitrix cleanup          Remove bootstrap scripts
+	xdebug setup            Configure host firewall access for Xdebug
+  xdebug check            Check Xdebug and DAP connectivity
+EOF
+        ;;
+esac
+

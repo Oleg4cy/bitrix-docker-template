@@ -1,0 +1,1 @@
+* * * * * www-data [ -f /var/www/html/bitrix/modules/main/tools/cron_events.php ] && /usr/local/bin/php -f /var/www/html/bitrix/modules/main/tools/cron_events.php >/proc/1/fd/1 2>/proc/1/fd/2
