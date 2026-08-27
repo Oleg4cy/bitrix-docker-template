@@ -529,7 +529,7 @@ Commands:
   bitrix restore          Prepare Bitrix backup restoration
   bitrix configure        Configure installed Bitrix for Docker environment
   bitrix cleanup          Remove bootstrap scripts
-	xdebug setup            Configure host firewall access for Xdebug
+  xdebug setup            Configure host firewall access for Xdebug
   xdebug check            Check Xdebug and DAP connectivity
 EOF
         ;;

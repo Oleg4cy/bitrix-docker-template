@@ -1,5 +1,4 @@
 .env
 docker/nginx/certs/
 /www/
-.codex
 
