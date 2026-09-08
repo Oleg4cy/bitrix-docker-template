@@ -414,12 +414,24 @@ EOF
 }
 
 case "$command" in
-    up)
+    build)
         ensure_env
         ensure_www
         ensure_certs
 
         docker compose up -d --build "$@"
+
+        docker compose exec -T nginx nginx -t
+        docker compose exec -T nginx nginx -s reload
+
+        show_urls
+        ;;
+    up)
+        ensure_env
+        ensure_www
+        ensure_certs
+
+        docker compose up -d "$@"
 
         docker compose exec -T nginx nginx -t
         docker compose exec -T nginx nginx -s reload
