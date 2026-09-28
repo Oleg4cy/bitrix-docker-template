@@ -419,7 +419,16 @@ case "$command" in
         ensure_www
         ensure_certs
 
-        docker compose up -d --build "$@"
+        # docker compose up -d --build "$@"
+        # docker compose up -d --build "$@"
+				docker compose build \
+					--build-arg HTTP_PROXY="${HTTP_PROXY:-}" \
+					--build-arg HTTPS_PROXY="${HTTPS_PROXY:-}" \
+					--build-arg ALL_PROXY="${ALL_PROXY:-}" \
+					--build-arg http_proxy="${http_proxy:-}" \
+					--build-arg https_proxy="${https_proxy:-}" \
+					--build-arg all_proxy="${all_proxy:-}" \
+					"$@"
 
         docker compose exec -T nginx nginx -t
         docker compose exec -T nginx nginx -s reload

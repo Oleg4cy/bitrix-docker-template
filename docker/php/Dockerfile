@@ -10,6 +10,7 @@ RUN apt-get update \
         passwd \
         cron \
         $PHPIZE_DEPS \
+				libtool \
         libfreetype6-dev \
         libjpeg62-turbo-dev \
         libpng-dev \

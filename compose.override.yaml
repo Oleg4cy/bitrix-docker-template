@@ -1,0 +1,8 @@
+services:
+  php:
+    build:
+      network: host
+
+  cron:
+    build:
+      network: host
