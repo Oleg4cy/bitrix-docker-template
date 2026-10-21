@@ -41,17 +41,14 @@ RUN apt-get purge -y --auto-remove $PHPIZE_DEPS \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cp "$PHP_INI_DIR/php.ini-development" "$PHP_INI_DIR/php.ini" \
-    && mkdir -p "$PHP_INI_DIR/bitrix.d" "$PHP_INI_DIR/xdebug.d"
+RUN cp "$PHP_INI_DIR/php.ini-development" "$PHP_INI_DIR/php.ini"
 
 COPY --from=composer:2 /usr/bin/composer /usr/local/bin/composer
 
-COPY bitrix.d/ "$PHP_INI_DIR/bitrix.d/"
-COPY xdebug.d/ "$PHP_INI_DIR/xdebug.d/"
+COPY bitrix.d/bitrix.ini "$PHP_INI_DIR/conf.d/zz-bitrix.ini"
+COPY xdebug.d/xdebug.ini "$PHP_INI_DIR/conf.d/zz-xdebug.ini"
 COPY msmtprc /etc/msmtprc
 
 RUN chmod 0644 /etc/msmtprc
-
-ENV PHP_INI_SCAN_DIR=":$PHP_INI_DIR/bitrix.d:$PHP_INI_DIR/xdebug.d"
 
 WORKDIR /var/www/html
