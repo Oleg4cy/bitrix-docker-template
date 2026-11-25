@@ -1,0 +1,9 @@
+services:
+  nginx:
+    volumes:
+      - type: bind
+        source: ./docker/nginx/wordpress.conf
+        target: /etc/nginx/conf.d/default.conf
+        read_only: true
+        bind:
+          create_host_path: false
