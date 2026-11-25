@@ -1,4 +1,4 @@
-FROM php:8.4-fpm-bookworm
+FROM php:8.4.28-fpm-bookworm
 ARG HOST_UID=1000
 ARG HOST_GID=1000
 
